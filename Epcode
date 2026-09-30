@@ -1,0 +1,352 @@
+/*************************************************
+      SMART LOCKER V4
+ ESP32 + RFID + Keypad + Servo + Telegram
+*************************************************/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+#include <SPI.h>
+#include <MFRC522.h>
+
+#include <Keypad.h>
+#include <ESP32Servo.h>
+
+/************ WiFi ************/
+const char* ssid = "sakura";
+const char* password = "s@123456";
+
+/************ Telegram ************/
+#define BOT_TOKEN "8845351400:AAHcgJOpdwYTtmOIbF4gTVsJ8dZMgYy8ksg"
+#define CHAT_ID "8985972233"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+/************ RC522 ************/
+#define SS_PIN   5
+#define RST_PIN  22
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+/************ Servo ************/
+#define SERVO_PIN 4
+
+Servo lockServo;
+
+/************ Keypad ************/
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] =
+{
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {13,12,14,27};
+byte colPins[COLS] = {26,25,33,32};
+
+Keypad keypad = Keypad(
+  makeKeymap(keys),
+  rowPins,
+  colPins,
+  ROWS,
+  COLS
+);
+
+/************ Password ************/
+String normalPIN = "1234";
+String duressPIN = "9999";
+String enteredPIN = "";
+
+/************ RFID UID ************/
+byte authorizedUID[4] =
+{
+  0x13,
+  0x25,
+  0x6F,
+  0x05
+};
+
+/************ Security ************/
+int wrongAttempts = 0;
+
+bool systemLocked = false;
+
+unsigned long lockStart = 0;
+
+const unsigned long lockDuration = 30000;
+
+/************ Servo Timer ************/
+bool lockerOpen = false;
+
+unsigned long servoTimer = 0;
+
+const unsigned long autoCloseTime = 5000;
+
+void setup()
+{
+  Serial.begin(115200);
+
+  SPI.begin();
+
+  rfid.PCD_Init();
+
+  lockServo.setPeriodHertz(50);
+  lockServo.attach(SERVO_PIN);
+  lockServo.write(0);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(".");
+    delay(500);
+  }
+
+  client.setInsecure();
+
+  Serial.println();
+  Serial.println("WiFi Connected");
+
+  bot.sendMessage(CHAT_ID,
+                  "Smart Locker Started",
+                  "");
+
+  Serial.println("System Ready");
+}
+/*************************************************
+                MODULE 2
+*************************************************/
+
+//-------------------- Servo --------------------
+
+void openLocker( )
+{
+  Serial.println("Opening Servo...");
+  lockServo.write(90);
+
+  lockerOpen = true;
+
+  servoTimer = millis();
+
+  Serial.println("Locker Opened");
+}
+
+void closeLocker()
+{
+  Serial.println("Closing Servo...");
+  lockServo.write(0);
+
+  lockerOpen = false;
+
+  Serial.println("Locker Closed");
+}
+
+//---------------- RFID Authentication ----------------
+
+bool checkRFID()
+{
+  if (!rfid.PICC_IsNewCardPresent())
+    return false;
+
+  if (!rfid.PICC_ReadCardSerial())
+    return false;
+
+  Serial.print("Card UID : ");
+
+  for (byte i = 0; i < rfid.uid.size; i++)
+  {
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    Serial.print(" ");
+  }
+
+  Serial.println();
+
+  bool authorized = true;
+
+  for (byte i = 0; i < 4; i++)
+  {
+    if (rfid.uid.uidByte[i] != authorizedUID[i])
+    {
+      authorized = false;
+      break;
+    }
+  }
+
+  if (authorized)
+  {
+    Serial.println("Authorized RFID");
+
+    wrongAttempts = 0;
+
+    openLocker();
+  }
+  else
+  {
+    Serial.println("Unauthorized RFID");
+
+    wrongAttempts++;
+
+    if (wrongAttempts >= 3)
+    {
+      systemLocked = true;
+
+      lockStart = millis();
+
+      bot.sendMessage(
+        CHAT_ID,
+        "⚠️ 3 Unauthorized RFID Attempts!\nLocker Locked for 30 Seconds.",
+        ""
+      );
+    }
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  return authorized;
+}
+/*************************************************
+                MODULE 3
+*************************************************/
+
+//--------------- PASSWORD CHECK ----------------
+
+void checkPassword()
+{
+  if (enteredPIN == normalPIN)
+  {
+    Serial.println("Correct PIN");
+
+    wrongAttempts = 0;
+
+    openLocker();
+  }
+
+  else if (enteredPIN == duressPIN)
+  {
+    Serial.println("Duress PIN Accepted");
+
+    wrongAttempts = 0;
+
+    openLocker();
+
+    bot.sendMessage(
+      CHAT_ID,
+      "🚨 EMERGENCY ALERT!\nDuress PIN Entered.\nLocker Opened.",
+      ""
+    );
+  }
+
+  else
+  {
+    Serial.println("Wrong PIN");
+
+    wrongAttempts++;
+
+    Serial.print("Attempts : ");
+    Serial.println(wrongAttempts);
+
+    if (wrongAttempts >= 3)
+    {
+      systemLocked = true;
+
+      lockStart = millis();
+
+      Serial.println("System Locked");
+
+      bot.sendMessage(
+        CHAT_ID,
+        "⚠️ 3 Wrong Password Attempts!\nLocker Locked for 30 Seconds.",
+        ""
+      );
+    }
+  }
+
+  enteredPIN = "";
+}
+
+//--------------- RESET LOCK ----------------
+
+void resetLock()
+{
+  if (systemLocked)
+  {
+    if (millis() - lockStart >= lockDuration)
+    {
+      systemLocked = false;
+
+      wrongAttempts = 0;
+
+      Serial.println("System Unlocked");
+    }
+  }
+}
+
+//--------------- AUTO CLOSE ----------------
+
+void autoCloseServo()
+{
+  if (lockerOpen)
+  {
+    if (millis() - servoTimer >= autoCloseTime)
+    {
+      closeLocker();
+    }
+  }
+}
+/*************************************************
+                MODULE 4
+*************************************************/
+
+void loop()
+{
+  // Reset lock after 30 seconds
+  resetLock();
+
+  // If system is locked, don't allow input
+  if (systemLocked)
+  {
+    return;
+  }
+
+  // Auto close servo after 5 seconds
+  autoCloseServo();
+
+  // Check RFID card
+  checkRFID();
+
+  // Read keypad
+  char key = keypad.getKey();
+
+  if (key)
+  {
+    Serial.print(key);
+
+    if (key == '*')
+    {
+      enteredPIN = "";
+      Serial.println("\nPIN Cleared");
+    }
+    else if (key == '#')
+    {
+      Serial.println();
+      checkPassword();
+    }
+    else
+    {
+      if (enteredPIN.length() < 4)
+      {
+        enteredPIN += key;
+      }
+    }
+  }
+}
